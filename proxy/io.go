@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/cipher"
 	"crypto/tls"
 	"encoding/binary"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/coyove/goflyway/pkg/logg"
 	"github.com/coyove/goflyway/pkg/rand"
+	"github.com/coyove/goflyway/pkg/trafficmon"
 	"github.com/coyove/tcpmux"
 )
 
@@ -31,11 +33,12 @@ type IOConfig struct {
 	Bucket  *TokenBucket
 	Chunked bool
 	Partial bool
+	Print   bool
 	Role    byte
 	WSCtrl  byte
 }
 
-func (iot *io_t) Bridge(target, source net.Conn, key []byte, options IOConfig) {
+func (iot *io_t) Bridge(target, source net.Conn, key *[ivLen]byte, options IOConfig) {
 	// copy from source, decrypt, to target
 	o := options
 	switch o.WSCtrl {
@@ -91,9 +94,10 @@ func (iot *io_t) Bridge(target, source net.Conn, key []byte, options IOConfig) {
 type io_t struct {
 	sync.Mutex
 	iid uint64
-	Tr  trafficSurvey // note 64bit align
+	Tr  trafficmon.Survey // note 64bit align
 
 	started  bool
+	sendStat bool
 	mconns   map[uintptr]*conn_state_t
 	idleTime int64
 
@@ -156,15 +160,15 @@ func (iot *io_t) StartPurgeConns(maxIdleTime int) {
 	iot.started = true
 	iot.mconns = make(map[uintptr]*conn_state_t)
 	iot.idleTime = int64(maxIdleTime)
-	iot.Tr.Init(20 * 60 / trafficSurveyinterval) // 20 mins
+	iot.Tr.Init(20*60, trafficSurveyinterval) // 20 mins
 
 	go func() {
 		count := 0
-		lastSent, lastRecved := uint64(0), uint64(0)
+		// lastSent, lastRecved := uint64(0), uint64(0)
 
-		for {
+		for tick := range time.Tick(time.Second) {
 			iot.Lock()
-			ns := time.Now().UnixNano()
+			ns := tick.UnixNano()
 
 			for id, state := range iot.mconns {
 				if (ns - state.last) > int64(maxIdleTime)*1e9 {
@@ -177,11 +181,7 @@ func (iot *io_t) StartPurgeConns(maxIdleTime int) {
 			count++
 
 			if count%trafficSurveyinterval == 0 {
-				sent, recv := iot.Tr.totalSent-lastSent, iot.Tr.totalRecved-lastRecved
-				lastSent, lastRecved = iot.Tr.totalSent, iot.Tr.totalRecved
-
-				iot.Tr.sent.Append(float64(sent) / trafficSurveyinterval)
-				iot.Tr.recved.Append(float64(recv) / trafficSurveyinterval)
+				iot.Tr.Update()
 			}
 
 			if count == 60 {
@@ -197,7 +197,10 @@ func (iot *io_t) StartPurgeConns(maxIdleTime int) {
 			}
 
 			iot.Unlock()
-			time.Sleep(time.Second)
+
+			if iot.sendStat {
+				sendTrafficStats(&iot.Tr)
+			}
 		}
 	}()
 }
@@ -256,7 +259,7 @@ func wsWrite(dst io.Writer, payload []byte, mask bool) (n int, err error) {
 
 func wsRead(src io.Reader) (payload []byte, n int, err error) {
 	buf := make([]byte, 4)
-	if n, err = io.ReadAtLeast(src, buf, 4); err != nil {
+	if n, err = io.ReadAtLeast(src, buf[:2], 2); err != nil {
 		return
 	}
 
@@ -267,18 +270,20 @@ func wsRead(src io.Reader) (payload []byte, n int, err error) {
 	mask := (buf[1] & 0x80) > 0
 	ln := int(buf[1] & 0x7f)
 
-	if ln != 126 {
-		if ln == 127 {
-			logg.E("goflyway doesn't accept payload longer than 65535, please check")
+	switch ln {
+	case 126:
+		if n, err = io.ReadAtLeast(src, buf[2:4], 2); err != nil {
 			return
 		}
-		// ln : 0 ~ 125
-	} else {
 		ln = int(binary.BigEndian.Uint16(buf[2:4]))
+	case 127:
+		logg.E("goflyway doesn't accept payload longer than 65535, please check")
+		return
+	default:
 	}
 
 	if mask {
-		if n, err = io.ReadAtLeast(src, buf, 4); err != nil {
+		if n, err = io.ReadAtLeast(src, buf[:4], 4); err != nil {
 			return
 		}
 		// now buf contains mask key
@@ -299,12 +304,14 @@ func wsRead(src io.Reader) (payload []byte, n int, err error) {
 	return
 }
 
-func (iot *io_t) Copy(dst io.Writer, src io.Reader, key []byte, config IOConfig) (written int64, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			logg.E("wtf, ", r)
-		}
-	}()
+func (iot *io_t) Copy(dst io.Writer, src io.Reader, key *[ivLen]byte, config IOConfig) (written int64, err error) {
+	if logg.GetLevel() == logg.LvDebug {
+		defer func() {
+			if r := recover(); r != nil {
+				logg.E("wtf, ", r)
+			}
+		}()
+	}
 
 	buf := make([]byte, 32*1024)
 	ctr := (*Cipher)(unsafe.Pointer(iot)).getCipherStream(key)
@@ -329,9 +336,9 @@ func (iot *io_t) Copy(dst io.Writer, src io.Reader, key []byte, config IOConfig)
 		if nr > 0 {
 			xbuf := buf[0:nr]
 			if config.Role == roleSend {
-				atomic.AddUint64(&iot.Tr.totalSent, uint64(nr))
+				iot.Tr.Send(int64(nr))
 			} else if config.Role == roleRecv {
-				atomic.AddUint64(&iot.Tr.totalRecved, uint64(nr))
+				iot.Tr.Recv(int64(nr))
 			}
 
 			if config.Partial && encrypted == sslRecordLen {
@@ -339,11 +346,12 @@ func (iot *io_t) Copy(dst io.Writer, src io.Reader, key []byte, config IOConfig)
 			} else if ctr != nil {
 
 				if encrypted+nr > sslRecordLen && config.Partial {
-					ctr.XorBuffer(xbuf[:sslRecordLen-encrypted])
+					ybuf := xbuf[:sslRecordLen-encrypted]
+					ctr.XORKeyStream(ybuf, ybuf)
 					encrypted = sslRecordLen
 					// we are done, the traffic coming later will be transfered as is
 				} else {
-					ctr.XorBuffer(xbuf)
+					ctr.XORKeyStream(xbuf, xbuf)
 					encrypted += nr
 				}
 
@@ -387,7 +395,6 @@ func (iot *io_t) Copy(dst io.Writer, src io.Reader, key []byte, config IOConfig)
 			}
 
 			if nr != nw {
-				logg.D(nr, " ", nw, xbuf)
 				err = io.ErrShortWrite
 				break
 			}
@@ -411,29 +418,37 @@ func (iot *io_t) Copy(dst io.Writer, src io.Reader, key []byte, config IOConfig)
 	return written, err
 }
 
-func (iot *io_t) NewReadCloser(src io.ReadCloser, key []byte) *IOReadCloserCipher {
+func (iot *io_t) NewReadCloser(src io.ReadCloser, key *[ivLen]byte) *IOReadCloserCipher {
 	return &IOReadCloserCipher{
 		src: src,
-		key: key,
 		ctr: (*Cipher)(unsafe.Pointer(iot)).getCipherStream(key),
+		tr:  &iot.Tr,
 	}
 }
 
 type IOReadCloserCipher struct {
 	src io.ReadCloser
-	key []byte
-	ctr *inplace_ctr_t
+	ctr cipher.Stream
+	tr  *trafficmon.Survey
 }
 
 func (rc *IOReadCloserCipher) Read(p []byte) (n int, err error) {
+	if rc.src == nil {
+		return 0, io.EOF
+	}
+
 	n, err = rc.src.Read(p)
 	if n > 0 && rc.ctr != nil {
-		rc.ctr.XorBuffer(p[:n])
+		rc.ctr.XORKeyStream(p[:n], p[:n])
+		rc.tr.Send(int64(n))
 	}
 
 	return
 }
 
 func (rc *IOReadCloserCipher) Close() error {
+	if rc.src == nil {
+		return nil
+	}
 	return rc.src.Close()
 }

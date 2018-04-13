@@ -1,6 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
+	"fmt"
+	"net/http/httputil"
+	"sync/atomic"
+
 	"github.com/coyove/goflyway/pkg/logg"
 
 	"bufio"
@@ -14,7 +21,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"time"
@@ -88,6 +94,8 @@ func (proxy *ProxyClient) sign(host string) *tls.Certificate {
 	return cert
 }
 
+var mitmSessionCounter int64
+
 func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 	_host, _ := splitHostPort(host)
 	// try self signing a cert of this host
@@ -99,6 +107,8 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 	client.Write(okHTTP)
 
 	go func() {
+
+		counter := atomic.AddInt64(&mitmSessionCounter, 1)
 
 		tlsClient := tls.Server(client, &tls.Config{
 			InsecureSkipVerify: true,
@@ -112,8 +122,52 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 
 		bufTLSClient := bufio.NewReader(tlsClient)
 
+		var wsToken string
+		var wsCallQueue *bytes.Buffer
+		var wsLastSend int64
+
 		for {
 			proxy.Cipher.IO.markActive(tlsClient, 0)
+
+			if wsToken != "" {
+				tlsClient.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				frame, err := wsReadFrame(tlsClient)
+				tlsClient.SetReadDeadline(time.Time{})
+
+				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						// Since we are (almostly) reading from a local connection,
+						// a timeout doesn't 100% mean we lost the client, we will keep
+						// trying until other errors occurred.
+						continue
+					} else {
+						if !isClosedConnErr(err) {
+							logg.E(err)
+						}
+						break
+					}
+				}
+
+				wsCallQueue.Write(frame)
+				if time.Now().UnixNano()-wsLastSend > 1e9 && wsCallQueue.Len() > 0 {
+					req, _ := http.NewRequest("GET", "http://"+proxy.Upstream, wsCallQueue)
+					cr := proxy.newRequest()
+					cr.Opt.Set(doForward)
+					cr.WSCallback = 'c'
+					cr.WSToken = wsToken
+					proxy.encryptRequest(req, cr)
+					if _, err = proxy.tp.RoundTrip(req); err != nil {
+						logg.E(err)
+						tlsClient.Write([]byte{0x88, 0}) // close frame
+						break
+					}
+
+					wsCallQueue.Reset()
+					wsLastSend = time.Now().UnixNano()
+				}
+
+				continue
+			}
 
 			var err error
 			var rURL string
@@ -121,14 +175,6 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 			if buf, err = bufTLSClient.Peek(3); err == io.EOF || len(buf) != 3 {
 				break
 			}
-
-			// switch string(buf) {
-			// case "GET", "POS", "HEA", "PUT", "OPT", "DEL", "PAT", "TRA":
-			// 	// good
-			// default:
-			// 	proxy.dialUpstreamAndBridge(&bufioConn{Conn: tlsClient, m: bufTLSClient}, host, auth, []byte{})
-			// 	return
-			// }
 
 			req, err := http.ReadRequest(bufTLSClient)
 			if err != nil {
@@ -138,7 +184,17 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 				break
 			}
 
-			rURL = req.URL.String()
+			if proxy.MITMDump != nil {
+				buf, _ := httputil.DumpRequest(req, false)
+
+				var b buffer
+				b.WriteString(fmt.Sprintf("# %s <<<<<< request %d >>>>>>\n", timeStampMilli(), counter))
+				b.Write(buf)
+
+				proxy.MITMDump.Write(b.Bytes())
+			}
+
+			rURL = req.URL.Host
 			req.Header.Del("Proxy-Authorization")
 			req.Header.Del("Proxy-Connection")
 
@@ -150,15 +206,29 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 				}
 
 				req.URL, err = url.Parse("https://" + h + req.URL.String())
-				rURL = req.URL.String()
+				rURL = req.URL.Host
 			}
 
 			logg.D(req.Method, "^ ", rURL)
 
-			resp, rkeybuf, err := proxy.encryptAndTransport(req)
+			var respBuf buffer
+			cr := proxy.newRequest()
+			cr.Opt.Set(doForward)
+			rkeybuf := proxy.encryptRequest(req, cr)
+
+			if proxy.MITMDump != nil {
+				req.Body = proxy.Cipher.IO.NewReadCloser(&dumpReadWriteWrapper{
+					reader:  req.Body.(*IOReadCloserCipher).src,
+					counter: counter,
+					file:    proxy.MITMDump,
+				}, rkeybuf)
+			}
+
+			resp, err := proxy.tp.RoundTrip(req)
+
 			if err != nil {
 				logg.E("proxy pass: ", rURL, ", ", err)
-				tlsClient.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n" + err.Error()))
+				tlsClient.Write(respBuf.Writes("HTTP/1.1 500 Internal Server Error\r\n\r\n", err.Error()).Bytes())
 				break
 			}
 
@@ -167,15 +237,53 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 
 			if strings.ToLower(resp.Header.Get("Connection")) != "upgrade" {
 				resp.Header.Set("Connection", "close")
-				tlsClient.Write([]byte("HTTP/1.1 " + resp.Status + "\r\n"))
+			} else if proxy.Policy.IsSet(PolicyWSCB) {
+				wsToken = base64.StdEncoding.EncodeToString(rkeybuf[:])
+				wsCallQueue = &bytes.Buffer{}
+				wsLastSend = time.Now().UnixNano()
+
+				go func() {
+					// Now let's start a goroutine which will query the upstream in every 1 second
+					// to see if there are any new WS frames sent from the host.
+					// If yes, it sends frames back to the browser, if upstream returns code other than 200, it exits
+					logg.D("WebSocket remote callback new token: ", wsToken)
+					for {
+						req, _ := http.NewRequest("GET", "http://"+proxy.Upstream, nil)
+						cr := proxy.newRequest()
+						cr.Opt.Set(doForward)
+						cr.WSCallback = 'b'
+						cr.WSToken = wsToken
+
+						iv := proxy.encryptRequest(req, cr)
+						resp, err := proxy.tp.RoundTrip(req)
+						if err != nil {
+							logg.E(err)
+							break
+						} else if resp.StatusCode != 200 {
+							logg.L("remote callback exited with code: ", resp.StatusCode)
+							break
+						} else if _, err := proxy.Cipher.IO.Copy(tlsClient, resp.Body, iv, IOConfig{Role: roleRecv}); err != nil {
+							if !isClosedConnErr(err) {
+								logg.E(err)
+							}
+							break
+						} else {
+							tryClose(resp.Body)
+						}
+
+						time.Sleep(time.Second)
+					}
+
+					tlsClient.Write([]byte{0x88, 0})
+					tlsClient.Close()
+					logg.D("WebSocket remote callback finished: ", wsToken)
+				}()
 			} else {
-				// we don't support upgrade in mitm
-				tlsClient.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+				tlsClient.Write(respBuf.R().Writes("HTTP/1.1 403 Forbidden\r\n\r\n").Bytes())
 				break
 			}
 
-			// buf, _ := httputil.DumpResponse(resp, true)
-			_ = httputil.DumpResponse
+			tlsClient.Write(respBuf.R().Writes("HTTP/1.1 ", resp.Status, "\r\n").Bytes())
 
 			hdr := http.Header{}
 			copyHeaders(hdr, resp.Header, proxy.Cipher, false, rkeybuf)
@@ -188,13 +296,71 @@ func (proxy *ProxyClient) manInTheMiddle(client net.Conn, host string) {
 				break
 			}
 
-			nr, err := proxy.Cipher.IO.Copy(tlsClient, resp.Body, rkeybuf, IOConfig{Partial: false, Chunked: true})
-			if err != nil {
-				logg.E("copy ", nr, " bytes: ", err)
+			var clientWriter io.Writer = tlsClient
+
+			if proxy.MITMDump != nil {
+				buf, _ := httputil.DumpResponse(resp, false)
+
+				var b buffer
+				b.WriteString(fmt.Sprintf("# %s >>>>>> response %d <<<<<<\n", timeStampMilli(), counter))
+				b.Write(buf)
+
+				proxy.MITMDump.Write(b.Bytes())
+				proxy.MITMDump.Sync()
+
+				clientWriter = &dumpReadWriteWrapper{writer: tlsClient, counter: counter, file: proxy.MITMDump}
 			}
+
+			if wsToken == "" {
+				// Chunked encoding will ruin the handshake of WS
+				nr, err := proxy.Cipher.IO.Copy(clientWriter, resp.Body, rkeybuf, IOConfig{
+					Partial: false,
+					Chunked: true,
+					Role:    roleRecv,
+				})
+				if err != nil {
+					logg.E("copy ", nr, " bytes: ", err)
+				}
+			}
+
 			tryClose(resp.Body)
 		}
 
 		tlsClient.Close()
 	}()
+}
+
+func wsReadFrame(src io.Reader) (payload []byte, err error) {
+	buf := make([]byte, 10)
+	buflen := 2
+	if _, err = io.ReadAtLeast(src, buf[:2], 2); err != nil {
+		return
+	}
+
+	ln := int(buf[1] & 0x7f)
+	switch ln {
+	case 127:
+		if _, err = io.ReadAtLeast(src, buf[2:10], 8); err != nil {
+			return
+		}
+		ln = int(binary.BigEndian.Uint64(buf[2:10]))
+		buflen = 10
+	case 126:
+		if _, err = io.ReadAtLeast(src, buf[2:4], 2); err != nil {
+			return
+		}
+		ln = int(binary.BigEndian.Uint16(buf[2:4]))
+		buflen = 4
+	default:
+		// <= 125 bytes
+	}
+
+	if (buf[1] & 0x80) > 0 {
+		ln += 4
+	}
+
+	payload = make([]byte, buflen+ln)
+	copy(payload[:buflen], buf[:buflen])
+	_, err = io.ReadAtLeast(src, payload[buflen:], ln)
+	return
 }

@@ -3,11 +3,14 @@
 package proxy
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"strconv"
 	"syscall"
 	"unsafe"
+
+	"github.com/coyove/goflyway/pkg/trafficmon"
 
 	"github.com/coyove/goflyway/pkg/fd"
 )
@@ -56,6 +59,48 @@ func protectFD(fd int) error {
 
 	if ret[0] != 0 {
 		return errors.New("protecting failed")
+	}
+
+	return nil
+}
+
+func sendTrafficStats(stat *trafficmon.Survey) error {
+	const errm = "sending traffic stats failed"
+
+	sock, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return err
+	}
+
+	var addr syscall.SockaddrUnix
+	addr.Name = "stat_path"
+
+	if err := (syscall.Connect(sock, &addr)); err != nil {
+		return err
+	}
+
+	payload := make([]byte, 16)
+	totalRecved, totalSent := stat.Data()
+	binary.LittleEndian.PutUint64(payload, uint64(totalSent))
+	binary.LittleEndian.PutUint64(payload[8:], uint64(totalRecved))
+
+	if n, err := syscall.Write(sock, payload); err != nil {
+		return err
+	} else if n != 16 {
+		return errors.New(errm)
+	}
+
+	ret := []byte{9}
+	if n, err := syscall.Read(sock, ret); err != nil {
+		return err
+	} else if n != 1 {
+		return errors.New(errm)
+	}
+
+	syscall.Close(sock)
+
+	if ret[0] != 0 {
+		return errors.New(errm)
 	}
 
 	return nil

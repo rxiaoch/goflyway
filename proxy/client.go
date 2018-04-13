@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"crypto/tls"
+	"os"
+
+	"github.com/coyove/goflyway/pkg/msg64"
 
 	acr "github.com/coyove/goflyway/pkg/aclrouter"
 	"github.com/coyove/goflyway/pkg/logg"
@@ -21,20 +24,28 @@ import (
 	"time"
 )
 
+type ResponseHook interface {
+	SetBody(r io.ReadCloser)
+}
+
+type ClientConfigMarshal struct {
+	Upstream       string  `json:"u"`
+	Policy         Options `json:"p"`
+	UserAuth       string  `json:"a"`
+	UDPRelayCoconn int     `json:"r"`
+	Mux            int     `json:"m"`
+
+	// Upstream params
+	Connect2     string `json:"c"`
+	Connect2Auth string `json:"t"`
+	DummyDomain  string `json:"d"`
+	URLHeader    string `json:"h"`
+}
+
 type ClientConfig struct {
-	Upstream string
-	Policy   Options
-	UserAuth string
+	ClientConfigMarshal
 
-	Connect2     string
-	Connect2Auth string
-	DummyDomain  string
-	URLHeader    string
-
-	UDPRelayCoconn int
-
-	Mux int
-
+	MITMDump *os.File
 	DNSCache *lru.Cache
 	CA       tls.Certificate
 	CACache  *lru.Cache
@@ -46,27 +57,31 @@ type ClientConfig struct {
 type ProxyClient struct {
 	*ClientConfig
 
-	rkeyHeader string
-	tp         *http.Transport // to upstream
-	tpq        *http.Transport // to upstream used for dns query
-	tpd        *http.Transport // to host directly
-	dummies    *lru.Cache
-	pool       *tcpmux.DialPool
+	tp      *http.Transport // to upstream
+	tpq     *http.Transport // to upstream used for dns query
+	tpd     *http.Transport // to host directly
+	dummies *lru.Cache
+	pool    *tcpmux.DialPool
+	addr    *net.TCPAddr
 
 	Localaddr string
 	Listener  *listenerWrapper
 }
 
-func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
+func (proxy *ProxyClient) dialUpstream(dialStyle byte) (conn net.Conn, err error) {
 	lat := time.Now().UnixNano()
 	if proxy.Connect2 == "" {
-		upstreamConn, err := proxy.pool.DialTimeout(timeoutDial)
-		if err != nil {
-			return nil, err
+		switch dialStyle {
+		case 'd':
+			conn, err = net.DialTimeout("tcp", proxy.Upstream, timeoutDial)
+		case 'v':
+			conn, err = vpnDial(proxy.Upstream)
+		default:
+			conn, err = proxy.pool.DialTimeout(timeoutDial)
 		}
 
-		proxy.IO.Tr.AddLatency(time.Now().UnixNano() - lat)
-		return upstreamConn, nil
+		proxy.IO.Tr.Latency(time.Now().UnixNano() - lat)
+		return
 	}
 
 	connectConn, err := net.DialTimeout("tcp", proxy.Connect2, timeoutDial)
@@ -76,9 +91,9 @@ func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
 
 	up, auth := proxy.Upstream, ""
 	if proxy.Connect2Auth != "" {
-		// if proxy.Connect2Auth == "socks5" {
+		// if proxy.Connect2Auth == "socks5" || true {
 		// 	connectConn.SetWriteDeadline(time.Now().Add(timeoutOp))
-		// 	if _, err = connectConn.Write(SOCKS5_HANDSHAKE); err != nil {
+		// 	if _, err = connectConn.Write(socksHandshake); err != nil {
 		// 		connectConn.Close()
 		// 		return nil, err
 		// 	}
@@ -103,8 +118,7 @@ func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
 		// 	}
 
 		// 	payload := []byte{socksVersion5, 1, 0, socksAddrDomain, byte(len(host))}
-		// 	payload = append(payload, []byte(host)...)
-		// 	payload = append(payload, 0, 0)
+		// 	payload = append(payload, []byte(host+"00")...)
 		// 	binary.BigEndian.PutUint16(payload[len(payload)-2:], uint16(port))
 
 		// 	connectConn.SetWriteDeadline(time.Now().Add(timeoutOp))
@@ -114,7 +128,7 @@ func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
 		// 	}
 
 		// 	connectConn.SetReadDeadline(time.Now().Add(timeoutOp))
-		// 	if n, err := io.ReadAtLeast(connectConn, buf, 5); err != nil || n < 5 {
+		// 	if n, err := io.ReadAtLeast(connectConn, buf[:5], 5); err != nil || n < 5 {
 		// 		connectConn.Close()
 		// 		return nil, err
 		// 	}
@@ -138,12 +152,20 @@ func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
 		// 	}
 
 		// 	connectConn.SetReadDeadline(time.Now().Add(timeoutOp))
-		// 	if n, err := io.ReadAtLeast(connectConn, buf, ln); err != nil || n < ln {
+		// 	if n, err := io.ReadAtLeast(connectConn, buf[5:5+ln], ln); err != nil || n < ln {
 		// 		connectConn.Close()
 		// 		return nil, err
 		// 	}
 
 		// 	return connectConn, nil
+		// _, addr, err := parseUDPHeader(nil, buf, true)
+		// connectConn.Close()
+		// if err != nil {
+		// 	return nil, err
+		// }
+
+		// logg.D("dial ", addr.String())
+		// return net.DialTimeout("tcp", addr.String(), timeoutDial)
 		// }
 
 		x := base64.StdEncoding.EncodeToString([]byte(proxy.Connect2Auth))
@@ -163,7 +185,7 @@ func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
 		return nil, err
 	}
 
-	if !bytes.Contains(respbuf, okHTTP[9:14]) { // []byte(" 200 ")
+	if !bytes.Contains(respbuf, []byte(" 200 ")) { //
 		x := string(respbuf)
 		if x = x[strings.Index(x, " ")+1:]; len(x) > 3 {
 			x = x[:3]
@@ -173,42 +195,39 @@ func (proxy *ProxyClient) dialUpstream() (net.Conn, error) {
 		return nil, errors.New("connect2: cannot connect to the HTTPS proxy (" + x + ")")
 	}
 
-	proxy.IO.Tr.AddLatency(time.Now().UnixNano() - lat)
+	proxy.IO.Tr.Latency(time.Now().UnixNano() - lat)
 	return connectConn, nil
 }
 
-func (proxy *ProxyClient) dialUpstreamAndBridge(downstreamConn net.Conn, host string, resp []byte, extra byte) net.Conn {
-	upstreamConn, err := proxy.dialUpstream()
+func (proxy *ProxyClient) dialUpstreamAndBridge(downstreamConn net.Conn, host string, resp []byte, extra, dialStyle byte) net.Conn {
+	upstreamConn, err := proxy.dialUpstream(0)
 	if err != nil {
 		logg.E(err)
 		downstreamConn.Close()
 		return nil
 	}
 
-	opt := Options(doConnect | extra)
+	r := proxy.Cipher.newRequest()
+	r.Opt = Options(doConnect | extra)
+	r.Auth = proxy.UserAuth
 	if proxy.Partial {
-		opt.Set(doPartial)
+		r.Opt.Set(doPartial)
 	}
 
-	rkey, rkeybuf := proxy.Cipher.NewIV(opt, nil, proxy.UserAuth)
-	pl := make([]string, 0, len(dummyHeaders)+3)
-	pl = append(pl,
-		"GET /"+proxy.Cipher.EncryptCompress(host, rkeybuf...)+" HTTP/1.1\r\n",
-		"Host: "+proxy.genHost()+"\r\n")
+	var pl buffer
+	pl.Writes("GET /", proxy.encryptHost(host, r), " HTTP/1.1\r\nHost: ", proxy.genHost(), "\r\n")
 
-	for _, i := range proxy.Rand.Perm(len(dummyHeaders)) {
-		if h := dummyHeaders[i]; h == "ph" {
-			pl = append(pl, proxy.rkeyHeader+": "+rkey+"\r\n")
-		} else if v, ok := proxy.dummies.Get(h); ok && v.(string) != "" {
-			pl = append(pl, h+": "+v.(string)+"\r\n")
+	for _, h := range dummyHeaders {
+		if v, ok := proxy.dummies.Get(h); ok && v.(string) != "" {
+			pl.Writes(h, ": ", v.(string), "\r\n")
 		}
 	}
 
-	upstreamConn.Write([]byte(strings.Join(pl, "") + "\r\n"))
+	upstreamConn.Write(pl.Writes("\r\n").Bytes())
 
 	buf, err := readUntil(upstreamConn, "\r\n\r\n")
 	// the first 15 bytes MUST be "HTTP/1.1 200 OK"
-	if err != nil || len(buf) < 15 || !bytes.Equal(buf[:15], okHTTP[:15]) {
+	if err != nil || len(buf) < 15 || !bytes.Equal(buf[:15], []byte("HTTP/1.1 200 OK")) {
 		if err != nil {
 			logg.E(host, ": ", err)
 		}
@@ -222,42 +241,43 @@ func (proxy *ProxyClient) dialUpstreamAndBridge(downstreamConn net.Conn, host st
 		downstreamConn.Write(resp)
 	}
 
-	go proxy.Cipher.IO.Bridge(downstreamConn, upstreamConn, rkeybuf, IOConfig{Partial: proxy.Partial})
+	go proxy.Cipher.IO.Bridge(downstreamConn, upstreamConn, &r.iv, IOConfig{Partial: proxy.Partial})
 
 	return upstreamConn
 }
 
-func (proxy *ProxyClient) dialUpstreamAndBridgeWS(downstreamConn net.Conn, host string, resp []byte, extra byte) net.Conn {
-	upstreamConn, err := proxy.dialUpstream()
+func (proxy *ProxyClient) dialUpstreamAndBridgeWS(downstreamConn net.Conn, host string, resp []byte, extra, dialStyle byte) net.Conn {
+	upstreamConn, err := proxy.dialUpstream(dialStyle)
 	if err != nil {
 		logg.E(err)
-		downstreamConn.Close()
+		if downstreamConn != nil {
+			downstreamConn.Close()
+		}
 		return nil
 	}
 
-	opt := Options(doConnect | doWebSocket | extra)
+	r := proxy.Cipher.newRequest()
+	r.Opt = Options(doConnect | doWebSocket | extra)
+	r.Auth = proxy.UserAuth
 	if proxy.Partial {
-		opt.Set(doPartial)
+		r.Opt.Set(doPartial)
 	}
 
-	rkey, rkeybuf := proxy.Cipher.NewIV(opt, nil, proxy.UserAuth)
-	var pl string
+	var pl buffer
 	if proxy.URLHeader == "" {
-		pl = "GET /" + proxy.Cipher.EncryptCompress(host, rkeybuf...) + " HTTP/1.1\r\n" +
-			"Host: " + proxy.genHost() + "\r\n"
+		pl.Writes("GET /", proxy.encryptHost(host, r), " HTTP/1.1\r\nHost: ", proxy.genHost(), "\r\n")
 	} else {
-		pl = "GET http://" + proxy.Upstream + "/ HTTP/1.1\r\n" +
-			"Host: " + proxy.Upstream + "\r\n" +
-			proxy.URLHeader + ": http://" + proxy.genHost() + "/" + proxy.Cipher.EncryptCompress(host, rkeybuf...) + "\r\n"
+		pl.Writes("GET http://", proxy.Upstream, "/ HTTP/1.1\r\nHost: ", proxy.Upstream, "\r\n",
+			proxy.URLHeader, ": http://", proxy.genHost(), "/", proxy.encryptHost(host, r), "\r\n")
 	}
 
-	pl += "Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Key: " + rkey[:24] + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n" +
-		proxy.rkeyHeader + ": " + rkey + "\r\n\r\n"
+	wsKey := [20]byte{}
+	proxy.Cipher.Rand.Read(wsKey[:])
 
-	upstreamConn.Write([]byte(pl))
+	pl.Writes("Upgrade: websocket\r\nConnection: Upgrade\r\n",
+		"Sec-WebSocket-Key: ", base64.StdEncoding.EncodeToString(wsKey[:]), "\r\nSec-WebSocket-Version: 13\r\n\r\n")
+
+	upstreamConn.Write(pl.Bytes())
 
 	buf, err := readUntil(upstreamConn, "\r\n\r\n")
 	if err != nil || !strings.HasPrefix(string(buf), "HTTP/1.1 101 Switching Protocols") {
@@ -266,15 +286,22 @@ func (proxy *ProxyClient) dialUpstreamAndBridgeWS(downstreamConn net.Conn, host 
 		}
 
 		upstreamConn.Close()
-		downstreamConn.Close()
+		if downstreamConn != nil {
+			downstreamConn.Close()
+		}
 		return nil
+	}
+
+	if extra == doMuxWS {
+		// we return here and handle the connection to tcpmux
+		return upstreamConn
 	}
 
 	if resp != nil {
 		downstreamConn.Write(resp)
 	}
 
-	go proxy.Cipher.IO.Bridge(downstreamConn, upstreamConn, rkeybuf, IOConfig{
+	go proxy.Cipher.IO.Bridge(downstreamConn, upstreamConn, &r.iv, IOConfig{
 		Partial: proxy.Partial,
 		WSCtrl:  wsClient,
 	})
@@ -308,12 +335,7 @@ func (proxy *ProxyClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "CONNECT" {
-		hij, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
-			return
-		}
-
+		hij, _ := w.(http.Hijacker) // No HTTP2
 		proxyClient, _, err := hij.Hijack()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -336,10 +358,10 @@ func (proxy *ProxyClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			proxy.manInTheMiddle(proxyClient, host)
 		} else if proxy.Policy.IsSet(PolicyWebSocket) {
 			logg.D("WS^ ", r.RequestURI, ext)
-			proxy.dialUpstreamAndBridgeWS(proxyClient, host, okHTTP, 0)
+			proxy.dialUpstreamAndBridgeWS(proxyClient, host, okHTTP, 0, 0)
 		} else {
 			logg.D("CONNECT^ ", r.RequestURI, ext)
-			proxy.dialUpstreamAndBridge(proxyClient, host, okHTTP, 0)
+			proxy.dialUpstreamAndBridge(proxyClient, host, okHTTP, 0, 0)
 		}
 	} else {
 		// normal http requests
@@ -358,7 +380,7 @@ func (proxy *ProxyClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var resp *http.Response
 		var err error
-		var rkeybuf []byte
+		var iv *[ivLen]byte
 
 		if ans, ext := proxy.canDirectConnect(r.Host); ans == ruleBlock {
 			logg.D("BLACKLIST ", r.Host, ext)
@@ -369,7 +391,10 @@ func (proxy *ProxyClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp, err = proxy.tpd.RoundTrip(r)
 		} else {
 			logg.D(r.Method, "^ ", r.Host, ext)
-			resp, rkeybuf, err = proxy.encryptAndTransport(r)
+			cr := proxy.newRequest()
+			cr.Opt.Set(doForward)
+			iv = proxy.encryptRequest(r, cr)
+			resp, err = proxy.tp.RoundTrip(r)
 		}
 
 		if err != nil {
@@ -382,14 +407,21 @@ func (proxy *ProxyClient) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			logg.D("[", resp.Status, "] - ", rURL)
 		}
 
-		copyHeaders(w.Header(), resp.Header, proxy.Cipher, false, rkeybuf)
+		copyHeaders(w.Header(), resp.Header, proxy.Cipher, false, iv)
 		w.WriteHeader(resp.StatusCode)
 
-		if nr, err := proxy.Cipher.IO.Copy(w, resp.Body, rkeybuf, IOConfig{Partial: false}); err != nil {
-			logg.E("copy ", nr, " bytes: ", err)
-		}
+		if h, ok := w.(ResponseHook); ok {
+			h.SetBody(proxy.Cipher.IO.NewReadCloser(resp.Body, iv))
+		} else {
+			if nr, err := proxy.Cipher.IO.Copy(w, resp.Body, iv, IOConfig{
+				Partial: false,
+				Role:    roleRecv,
+			}); err != nil {
+				logg.E("copy ", nr, " bytes: ", err)
+			}
 
-		tryClose(resp.Body)
+			tryClose(resp.Body)
+		}
 	}
 }
 
@@ -471,10 +503,10 @@ func (proxy *ProxyClient) handleSocks(conn net.Conn) {
 			proxy.dialHostAndBridge(conn, host, okSOCKS)
 		} else if proxy.Policy.IsSet(PolicyWebSocket) {
 			logg.D("WS^ ", host, ext)
-			proxy.dialUpstreamAndBridgeWS(conn, host, okSOCKS, 0)
+			proxy.dialUpstreamAndBridgeWS(conn, host, okSOCKS, 0, 0)
 		} else {
 			logg.D("SOCKS^ ", host, ext)
-			proxy.dialUpstreamAndBridge(conn, host, okSOCKS, 0)
+			proxy.dialUpstreamAndBridge(conn, host, okSOCKS, 0, 0)
 		}
 	case 3:
 		relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero, Port: 0})
@@ -487,17 +519,17 @@ func (proxy *ProxyClient) handleSocks(conn net.Conn) {
 	}
 }
 
-func (proxy *ProxyClient) UpdateKey(newKey string) {
-	proxy.Cipher.Init(newKey)
-	proxy.rkeyHeader = "X-" + proxy.Cipher.Alias
-}
-
 func (proxy *ProxyClient) Start() error {
+	mux, err := net.ListenTCP("tcp", proxy.addr)
+	if err != nil {
+		return err
+	}
+
+	proxy.Listener = &listenerWrapper{mux, proxy}
 	return http.Serve(proxy.Listener, proxy)
 }
 
 func NewClient(localaddr string, config *ClientConfig) *ProxyClient {
-	var mux net.Listener
 	var err error
 
 	upURL, err := url.Parse("http://" + config.Upstream)
@@ -510,25 +542,39 @@ func NewClient(localaddr string, config *ClientConfig) *ProxyClient {
 	proxy := &ProxyClient{
 		pool: tcpmux.NewDialer(config.Upstream, config.Mux),
 
-		tp:  &http.Transport{TLSClientConfig: tlsSkip, Proxy: proxyURL},
+		tp:  &http.Transport{TLSClientConfig: tlsSkip, Proxy: proxyURL, Dial: (&net.Dialer{Timeout: timeoutDial}).Dial},
 		tpd: &http.Transport{TLSClientConfig: tlsSkip},
 		tpq: &http.Transport{TLSClientConfig: tlsSkip, Proxy: proxyURL, ResponseHeaderTimeout: timeoutOp, Dial: (&net.Dialer{Timeout: timeoutDial}).Dial},
 
-		dummies:    lru.NewCache(len(dummyHeaders)),
-		rkeyHeader: "X-" + config.Cipher.Alias,
+		dummies: lru.NewCache(int64(len(dummyHeaders))),
 
 		ClientConfig: config,
 	}
 
 	if config.Mux > 0 {
 		proxy.Cipher.IO.Ob = proxy.pool
+
+		if config.Policy.IsSet(PolicyWebSocket) {
+			// dialUpstreamAndBridgeWS will call dialUpstream,
+			// and dialUpstream will call OnDial again,
+			// so we set dial style to 'd' (direct) to avoid infinite loop
+			// If we are in VPN mode, this value will be later set to 'v' (vpn)
+
+			proxy.pool.OnDial = func(address string) (conn net.Conn, err error) {
+				conn = proxy.dialUpstreamAndBridgeWS(nil, address, nil, doMuxWS, 'd')
+				if conn == nil {
+					err = fmt.Errorf("ws error")
+				}
+				return
+			}
+		}
 	}
 
-	tcpmux.Version = checksum1b([]byte(config.Cipher.Alias)) | 0x80
+	tcpmux.Version = byte(msg64.Crc16b(0, []byte(config.Cipher.Alias))) | 0x80
 
 	if proxy.Connect2 != "" || proxy.Mux != 0 {
 		proxy.tp.Proxy, proxy.tpq.Proxy = nil, nil
-		proxy.tpq.Dial = func(network, address string) (net.Conn, error) { return proxy.dialUpstream() }
+		proxy.tpq.Dial = func(network, address string) (net.Conn, error) { return proxy.dialUpstream(0) }
 		proxy.tp.Dial = proxy.tpq.Dial
 	}
 
@@ -544,30 +590,36 @@ func NewClient(localaddr string, config *ClientConfig) *ProxyClient {
 	}
 
 	if port, lerr := strconv.Atoi(localaddr); lerr == nil {
-		mux, err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv6zero, Port: port})
-		localaddr = "127.0.0.1:" + localaddr
+		proxy.addr = &net.TCPAddr{IP: net.IPv6zero, Port: port}
+		localaddr = "0.0.0.0:" + localaddr
 	} else {
-		mux, err = net.Listen("tcp", localaddr)
+		proxy.addr, err = net.ResolveTCPAddr("tcp", localaddr)
+		if err != nil {
+			logg.F(err)
+			return nil
+		}
+
 		if localaddr[0] == ':' {
-			localaddr = "127.0.0.1" + localaddr
+			localaddr = "0.0.0.0" + localaddr
 		}
 	}
 
-	if err != nil {
-		logg.F(err)
-		return nil
-	}
-
-	proxy.Listener = &listenerWrapper{mux, proxy}
 	proxy.Localaddr = localaddr
 
 	if proxy.Policy.IsSet(PolicyVPN) {
-		proxy.pool.OnDial = vpnDial
-		// proxy.tp.MaxIdleConns = 2
-		// proxy.tpd.MaxIdleConns = 2
-		// proxy.tpq.MaxIdleConns = 2
-		// proxy.tpd.Dial = func(network, address string) (net.Conn, error) { return vpnDial(address) }
+		if config.Policy.IsSet(PolicyWebSocket) {
+			proxy.pool.OnDial = func(address string) (conn net.Conn, err error) {
+				conn = proxy.dialUpstreamAndBridgeWS(nil, address, nil, doMuxWS, 'v')
+				if conn == nil {
+					err = fmt.Errorf("ws error")
+				}
+				return
+			}
+		} else {
+			proxy.pool.OnDial = vpnDial
+		}
 
+		proxy.IO.sendStat = true
 		proxy.pool.DialTimeout(time.Second)
 	}
 
